@@ -1,0 +1,43 @@
+{
+  "name": "pi-vnc",
+  "version": "0.1.0",
+  "description": "Pi extension: remote desktop control via VNC (click, mouse, keyboard, screenshots)",
+  "author": "",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "main": "extensions/index.ts",
+  "files": [
+    "extensions",
+    "skills",
+    "src",
+    "package.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@computernewb/nodejs-rfb": "^0.4.5",
+    "typebox": "^1.3.7"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@types/node": "^25.3.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/index.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  }
+}
