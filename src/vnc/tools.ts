@@ -4,15 +4,17 @@
  *
  * - Errors are thrown (native tool errors) instead of returned as text.
  * - Click/key/typing timing preserved exactly from mcp-vnc.
- * - Screenshot keeps the pixel-format conversion paths (RGB24/RGB565/8bpp -> RGBA)
- *   and the >800KB resize fallback (pure-JS PNG encoder, no sharp). Dropped: corruption-pattern heuristics and
+ * - Screenshot keeps the pixel-format conversion paths (RGB24/RGB565/8bpp -> RGBA),
+ *   always encodes at native dimensions (never resized, so click coordinates map
+ *   1:1 to the image), and has no delay parameter (the agent controls its own
+ *   timing). Pure-JS PNG encoder, no sharp. Dropped: corruption-pattern heuristics and
  *   dead BGRX conversion (never invoked upstream) and all debug logging.
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { VncClient } from "@computernewb/nodejs-rfb";
-import { encodeFramebuffer } from "./image-encode.js";
+import { encodePng } from "./image-encode.js";
 import { VncConnectionManager, sleep } from "./vnc-client.js";
 import { charNeedsShift, getKeysym, getUnshiftedChar, parseKeyInput } from "./keyboard.js";
 
@@ -247,19 +249,7 @@ export const typeMultilineTool: ToolDefinition<typeof typeMultilineSchema, undef
 
 // ── vnc_screenshot ───────────────────────────────────────────────────────────
 
-const MAX_DELAY_MS = 300000;
-const MAX_IMAGE_BYTES = 800000;
-
-const screenshotSchema = Type.Object({
-	delay: Type.Optional(
-		Type.Number({
-			description: "Delay in milliseconds before taking screenshot (useful for waiting for processes to complete)",
-			minimum: 0,
-			maximum: MAX_DELAY_MS,
-			default: 0,
-		}),
-	),
-});
+const screenshotSchema = Type.Object({});
 type ScreenshotInput = Static<typeof screenshotSchema>;
 
 /** Convert a non-4-byte-per-pixel framebuffer to RGBA (RGB24, RGB565, 8-bit). */
@@ -317,23 +307,14 @@ function convertToRGBA(buffer: Buffer, width: number, height: number): Buffer {
 interface ScreenshotDetails {
 	width: number;
 	height: number;
-	delay: number;
-	resized: boolean;
 }
 
 export const screenshotTool: ToolDefinition<typeof screenshotSchema, ScreenshotDetails> = {
 	name: "vnc_screenshot",
 	label: "vnc_screenshot",
-	description:
-		"Take a screenshot of the VNC-controlled desktop and return it as an image. Optional delay (ms) before capture to wait for things to render.",
+	description: "Take a screenshot of the VNC-controlled desktop and return it as an image. Returns the framebuffer at native dimensions, so click coordinates map 1:1 to the image.",
 	parameters: screenshotSchema,
-	execute: async (_id, args, signal) => {
-		const delay = args.delay ?? 0;
-		if (delay < 0 || delay > MAX_DELAY_MS) {
-			throw new Error(`Delay must be between 0 and ${MAX_DELAY_MS}ms`);
-		}
-		if (delay > 0) await sleep(delay, signal);
-
+	execute: async (_id, _args, signal) => {
 		return withConnection(async (client) => {
 			const width = client.clientWidth || 0;
 			const height = client.clientHeight || 0;
@@ -378,15 +359,16 @@ export const screenshotTool: ToolDefinition<typeof screenshotSchema, ScreenshotD
 				throw new Error(`Framebuffer size mismatch: expected ${expectedSize}, got ${framebuffer.length}`);
 			}
 
-			const { buffer: imageBuffer, width: finalWidth, height: finalHeight } = encodeFramebuffer(width, height, framebuffer, MAX_IMAGE_BYTES);
-			const resized = finalWidth !== width;
+			const imageBuffer = encodePng(width, height, framebuffer);
 
 			return {
 				content: [
-					{ type: "text", text: `Screenshot captured (${finalWidth}x${finalHeight})${resized ? ` (resized from ${width}x${height})` : ""}${delay > 0 ? ` (after ${delay}ms delay)` : ""}` },
+					{ type: "text", text: `Screenshot captured (${width}x${height}) — ${
+						(imageBuffer.length / 1024).toFixed(0)
+					}KB` },
 					{ type: "image", data: imageBuffer.toString("base64"), mimeType: "image/png" },
 				],
-				details: { width: finalWidth, height: finalHeight, delay, resized },
+				details: { width, height },
 			};
 		}, signal);
 	},
