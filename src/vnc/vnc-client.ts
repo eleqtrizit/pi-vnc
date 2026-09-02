@@ -39,6 +39,58 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 const CONNECT_TIMEOUT_MS = 15000;
 
+/**
+ * Fail callbacks for every in-flight VNC connection.
+ *
+ * nodejs-rfb invokes _readWorker() un-awaited, so a throw inside the read
+ * loop (e.g. "No password supplied for VNC authentication.") surfaces as an
+ * unhandled rejection, which Node escalates to uncaughtException and kills
+ * the whole Pi process with it. We install a process-level unhandledRejection
+ * guard while any VNC connection is live and route library-originated
+ * rejections to the affected connections instead.
+ */
+const activeFailers = new Set<(message: string) => void>();
+const failersByClient = new WeakMap<VncClient, (message: string) => void>();
+
+const NODEJS_RFB_ORIGIN = /nodejs-rfb/;
+
+/** Match a rejection to a VNC cause and translate it into an actionable message. */
+export function classifyRejection(reason: unknown): { isVnc: boolean; message: string } {
+	const isFromRfb = reason instanceof Error && NODEJS_RFB_ORIGIN.test(reason.stack ?? "");
+	if (!isFromRfb) return { isVnc: false, message: reason instanceof Error ? reason.message : String(reason) };
+
+	const raw = reason instanceof Error ? reason.message : String(reason);
+	if (/no password supplied/i.test(raw)) {
+		return {
+			isVnc: true,
+			message:
+				"VNC server requires authentication but no password is configured. " +
+				"Set one with /vnc-config <host[:port]> <password> or the VNC_PASSWORD env var.",
+		};
+	}
+	return { isVnc: true, message: `VNC connection error: ${raw}` };
+}
+
+function onUnhandledRejection(reason: unknown): void {
+	const { isVnc, message } = classifyRejection(reason);
+	if (!isVnc) {
+		// Not ours: log it rather than silently swallowing it. Node's default
+		// crash-on-unhandled-rejection is already suppressed for the duration
+		// of this guard because a listener is registered.
+		console.error("[pi-vnc] Unhandled rejection (not VNC-related):", reason);
+		return;
+	}
+	for (const fail of [...activeFailers]) fail(message);
+}
+
+function ensureRejectionGuard(): void {
+	if (activeFailers.size === 0) process.on("unhandledRejection", onUnhandledRejection);
+}
+
+function releaseRejectionGuard(): void {
+	if (activeFailers.size === 0) process.off("unhandledRejection", onUnhandledRejection);
+}
+
 export class VncConnectionManager {
 	/** Execute a callback with a fresh VNC connection that has received its initial frame. */
 	async executeWithConnection<T>(
@@ -61,7 +113,6 @@ export class VncConnectionManager {
 				reject(new Error("Operation aborted"));
 				return;
 			}
-
 			const client = new VncClient({
 				debug: false,
 				encodings: [
@@ -86,10 +137,14 @@ export class VncConnectionManager {
 				signal?.removeEventListener("abort", onAbort);
 			};
 
+
 			let hasReceivedInitialFramebuffer = false;
 
 			const timer = setTimeout(() => {
 				settle(() => {
+					activeFailers.delete(fail);
+					failersByClient.delete(client);
+					releaseRejectionGuard();
 					try {
 						client.disconnect();
 					} catch {}
@@ -99,6 +154,9 @@ export class VncConnectionManager {
 
 			const onAbort = () => {
 				settle(() => {
+					activeFailers.delete(fail);
+					failersByClient.delete(client);
+					releaseRejectionGuard();
 					try {
 						client.disconnect();
 					} catch {}
@@ -114,12 +172,23 @@ export class VncConnectionManager {
 			// hang until the 15s timer fires and mask the real cause.
 			const fail = (message: string) => {
 				settle(() => {
+					activeFailers.delete(fail);
+					failersByClient.delete(client);
+					releaseRejectionGuard();
 					try {
 						client.disconnect();
 					} catch {}
 					reject(new Error(message));
 				});
 			};
+
+			// Route nodejs-rfb's escaped rejections (its _readWorker runs
+			// un-awaited) to this connection's fail(). Registered until
+			// disconnect() runs: _readWorker keeps running mid-session and can
+			// still throw asynchronously after the initial frame was received.
+			activeFailers.add(fail);
+			ensureRejectionGuard();
+			failersByClient.set(client, fail);
 
 			client.on("connectError", (error: Error) => fail(`VNC connection failed: ${error.message}`));
 			client.on("connectTimeout", () => fail("VNC connection timed out"));
@@ -161,6 +230,12 @@ export class VncConnectionManager {
 	}
 
 	private disconnect(client: VncClient): void {
+		const fail = failersByClient.get(client);
+		if (fail !== undefined) {
+			activeFailers.delete(fail);
+			failersByClient.delete(client);
+		}
+		releaseRejectionGuard();
 		try {
 			client.disconnect();
 		} catch {}
