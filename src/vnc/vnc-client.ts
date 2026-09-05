@@ -73,22 +73,66 @@ export function classifyRejection(reason: unknown): { isVnc: boolean; message: s
 
 function onUnhandledRejection(reason: unknown): void {
 	const { isVnc, message } = classifyRejection(reason);
-	if (!isVnc) {
-		// Not ours: log it rather than silently swallowing it. Node's default
-		// crash-on-unhandled-rejection is already suppressed for the duration
+	const failers = [...activeFailers];
+	if (failers.length === 0) {
+		// Not ours, or arrived after every failer detached (e.g. during
+		// disconnect()): log it rather than silently swallowing it. Node's
+		// default crash-on-unhandled-rejection is suppressed for the duration
 		// of this guard because a listener is registered.
+		if (isVnc) console.error(`[pi-vnc] Late VNC rejection: ${message}`);
+		else console.error("[pi-vnc] Unhandled rejection (not VNC-related):", reason);
+		return;
+	}
+	if (!isVnc) {
 		console.error("[pi-vnc] Unhandled rejection (not VNC-related):", reason);
 		return;
 	}
-	for (const fail of [...activeFailers]) fail(message);
+	for (const fail of failers) fail(message);
 }
+
+let guardAttached = false;
+let guardReleaseTimer: NodeJS.Timeout | undefined;
 
 function ensureRejectionGuard(): void {
-	if (activeFailers.size === 0) process.on("unhandledRejection", onUnhandledRejection);
+	// A pending delayed release means a connection died and reattached within
+	// the same tick; cancel the release instead of detaching under it.
+	if (guardReleaseTimer !== undefined) {
+		clearTimeout(guardReleaseTimer);
+		guardReleaseTimer = undefined;
+	}
+	if (!guardAttached) {
+		process.on("unhandledRejection", onUnhandledRejection);
+		guardAttached = true;
+	}
 }
 
+/**
+ * Detach the guard one tick after the last connection ends.
+ *
+ * The release must be deferred: nodejs-rfb's disconnect() synchronously
+ * rejects the read loop's pending awaiter (socketBuffer.end() in
+ * resetState()), and that rejection fires as unhandledRejection in the same
+ * tick. Releasing the guard before disconnect() removes the listener first,
+ * so the rejection crashes Node with uncaughtException. Waiting one
+ * macrotask guarantees the listener is still attached when it fires.
+ */
 function releaseRejectionGuard(): void {
-	if (activeFailers.size === 0) process.off("unhandledRejection", onUnhandledRejection);
+	if (guardAttached && activeFailers.size === 0 && guardReleaseTimer === undefined) {
+		guardReleaseTimer = setTimeout(() => {
+			guardReleaseTimer = undefined;
+			if (guardAttached && activeFailers.size === 0) {
+				process.off("unhandledRejection", onUnhandledRejection);
+				guardAttached = false;
+			}
+		}, 0);
+	}
+}
+
+/** Remove a failer from the active sets and schedule guard release. */
+function detachFailer(client: VncClient, fail: (message: string) => void): void {
+	activeFailers.delete(fail);
+	failersByClient.delete(client);
+	releaseRejectionGuard();
 }
 
 export class VncConnectionManager {
@@ -142,9 +186,7 @@ export class VncConnectionManager {
 
 			const timer = setTimeout(() => {
 				settle(() => {
-					activeFailers.delete(fail);
-					failersByClient.delete(client);
-					releaseRejectionGuard();
+					detachFailer(client, fail);
 					try {
 						client.disconnect();
 					} catch {}
@@ -154,9 +196,7 @@ export class VncConnectionManager {
 
 			const onAbort = () => {
 				settle(() => {
-					activeFailers.delete(fail);
-					failersByClient.delete(client);
-					releaseRejectionGuard();
+					detachFailer(client, fail);
 					try {
 						client.disconnect();
 					} catch {}
@@ -172,9 +212,7 @@ export class VncConnectionManager {
 			// hang until the 15s timer fires and mask the real cause.
 			const fail = (message: string) => {
 				settle(() => {
-					activeFailers.delete(fail);
-					failersByClient.delete(client);
-					releaseRejectionGuard();
+					detachFailer(client, fail);
 					try {
 						client.disconnect();
 					} catch {}
@@ -231,11 +269,7 @@ export class VncConnectionManager {
 
 	private disconnect(client: VncClient): void {
 		const fail = failersByClient.get(client);
-		if (fail !== undefined) {
-			activeFailers.delete(fail);
-			failersByClient.delete(client);
-		}
-		releaseRejectionGuard();
+		if (fail !== undefined) detachFailer(client, fail);
 		try {
 			client.disconnect();
 		} catch {}
